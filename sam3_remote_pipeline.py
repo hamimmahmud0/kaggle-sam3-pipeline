@@ -41,7 +41,7 @@ HOSTNAME = socket.gethostname()
 LOGGER = logging.getLogger("sam3_pipeline")
 _FFMPEG_NVENC_AVAILABLE = None
 
-
+# iso
 def iso_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
