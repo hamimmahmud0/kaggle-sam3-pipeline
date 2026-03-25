@@ -143,6 +143,15 @@ def clear_screen():
     sys.stdout.flush()
 
 
+def stream_command(r: RemoteRunner, script: str):
+    transport = r.client.get_transport()
+    if transport is None:
+        raise RemoteError("SSH transport is not available.")
+    channel = transport.open_session()
+    channel.exec_command("bash -lc " + shlex.quote(script))
+    return channel
+
+
 def parse_env_file(path: Path) -> dict:
     values = {}
     if not path.exists():
@@ -213,6 +222,7 @@ def resolve_config(args) -> dict:
         "launch": ["password"],
         "status": ["password"],
         "samtop": ["password"],
+        "samlog": ["password"],
         "full": ["password", "drive_folder_url"],
     }
     missing = [key for key in required_by_command.get(args.command, []) if cfg.get(key) in (None, "")]
@@ -301,6 +311,7 @@ fi
 {shlex.quote(cfg['remote_miniforge'])}/micromamba run -p {shlex.quote(cfg['remote_miniforge'] + '/envs/sam3')} python -m pip install --upgrade pip
 {shlex.quote(cfg['remote_miniforge'])}/micromamba run -p {shlex.quote(cfg['remote_miniforge'] + '/envs/sam3')} python -m pip install "setuptools<81" wheel
 {shlex.quote(cfg['remote_miniforge'])}/micromamba run -p {shlex.quote(cfg['remote_miniforge'] + '/envs/sam3')} python -m pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+{shlex.quote(cfg['remote_miniforge'])}/micromamba run -p {shlex.quote(cfg['remote_miniforge'] + '/envs/sam3')} python -m pip install torchcodec
 cd {shlex.quote(cfg['remote_repo'])}
 {shlex.quote(cfg['remote_miniforge'])}/micromamba run -p {shlex.quote(cfg['remote_miniforge'] + '/envs/sam3')} python -m pip install -e .
 {shlex.quote(cfg['remote_miniforge'])}/micromamba run -p {shlex.quote(cfg['remote_miniforge'] + '/envs/sam3')} python -m pip install requests beautifulsoup4 gdown einops "opencv-python-headless<4.12" pycocotools psutil decord
@@ -337,6 +348,30 @@ for path in files:
     text = text.replace('torch.autocast(device_type=\"cuda\", dtype=torch.bfloat16)', 'torch.autocast(device_type=\"cuda\", dtype=_SAM3_AUTOCAST_DTYPE)')
     text = text.replace('.to(torch.bfloat16)', '.to(_SAM3_AUTOCAST_DTYPE)')
     path.write_text(text, encoding='utf-8')
+PY
+"""
+    r.bash(script, timeout=600)
+
+
+def patch_repo_for_low_ram(r: RemoteRunner, cfg: dict):
+    print_step("Patching the SAM3 repo for stable bounded-memory video loading")
+    predictor_path = str(PurePosixPath(cfg["remote_repo"]) / "sam3/model/sam3_video_predictor.py")
+    script = f"""
+set -e
+python - <<'PY'
+from pathlib import Path
+
+path = Path({predictor_path!r})
+text = path.read_text(encoding='utf-8')
+original = text
+text = text.replace("async_loading_frames=True", "async_loading_frames=False")
+text = text.replace('video_loader_type=\"torchcodec\"', 'video_loader_type=\"cv2\"')
+text = text.replace("video_loader_type='torchcodec'", "video_loader_type='cv2'")
+if text == original:
+    print("No predictor default patch was needed.")
+else:
+    path.write_text(text, encoding='utf-8')
+    print(f"Patched {{path}} for cv2 bounded-memory defaults.")
 PY
 """
     r.bash(script, timeout=600)
@@ -420,6 +455,7 @@ PY
 def upload_pipeline(r: RemoteRunner):
     print_step("Uploading the remote pipeline scripts")
     verify_local_files()
+    r.bash("mkdir -p /kaggle/working/SAM3", timeout=120)
     r.write_text("/kaggle/working/SAM3/sam3_remote_pipeline.py", REMOTE_PIPELINE_LOCAL.read_text(encoding="utf-8"))
     r.write_text("/kaggle/working/SAM3/run_pipeline.sh", REMOTE_LAUNCHER_LOCAL.read_text(encoding="utf-8"), executable=True)
     r.bash("python -m py_compile /kaggle/working/SAM3/sam3_remote_pipeline.py", timeout=600)
@@ -770,12 +806,87 @@ def run_samtop(r: RemoteRunner, cfg: dict, refresh_seconds: float, once: bool):
             print()
 
 
+def samlog_color(worker_name: str) -> str:
+    return {"worker_a": "cyan", "worker_b": "yellow", "stderr": "red"}.get(worker_name, "gray")
+
+
+def print_samlog_line(worker_name: str | None, line: str):
+    text = line.rstrip("\r\n")
+    if not text:
+        print()
+        return
+    if worker_name:
+        prefix = colorize(f"[{worker_name}]", samlog_color(worker_name))
+        print(f"{prefix} {text}")
+        return
+    print(colorize(text, "gray"))
+
+
+def run_samlog(r: RemoteRunner, cfg: dict, lines: int):
+    workspace = PurePosixPath(cfg["remote_workspace"])
+    logs_dir = workspace / "logs"
+    script = f"""
+set -e
+mkdir -p {shlex.quote(str(logs_dir))}
+touch {shlex.quote(str(logs_dir / 'worker_a.log'))} {shlex.quote(str(logs_dir / 'worker_b.log'))}
+tail -n {max(lines, 1)} -F {shlex.quote(str(logs_dir / 'worker_a.log'))} {shlex.quote(str(logs_dir / 'worker_b.log'))}
+"""
+    channel = stream_command(r, script)
+    channel.settimeout(0.2)
+    current_worker = None
+    stdout_buffer = ""
+    stderr_buffer = ""
+    header_map = {
+        f"==> {logs_dir / 'worker_a.log'} <==": "worker_a",
+        f"==> {logs_dir / 'worker_b.log'} <==": "worker_b",
+    }
+    if sys.stdout.isatty():
+        print(colorize("samlog", "bold") + f"  remote={logs_dir}  ctrl+c to quit")
+        print()
+    try:
+        while True:
+            if channel.recv_ready():
+                stdout_buffer += channel.recv(4096).decode("utf-8", "replace")
+                while "\n" in stdout_buffer:
+                    line, stdout_buffer = stdout_buffer.split("\n", 1)
+                    stripped = line.strip()
+                    if stripped in header_map:
+                        current_worker = header_map[stripped]
+                        continue
+                    print_samlog_line(current_worker, line)
+            if channel.recv_stderr_ready():
+                stderr_buffer += channel.recv_stderr(4096).decode("utf-8", "replace")
+                while "\n" in stderr_buffer:
+                    line, stderr_buffer = stderr_buffer.split("\n", 1)
+                    print_samlog_line("stderr", line)
+            if channel.exit_status_ready():
+                while channel.recv_ready():
+                    stdout_buffer += channel.recv(4096).decode("utf-8", "replace")
+                while channel.recv_stderr_ready():
+                    stderr_buffer += channel.recv_stderr(4096).decode("utf-8", "replace")
+                break
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if stdout_buffer:
+            for line in stdout_buffer.splitlines():
+                print_samlog_line(current_worker, line)
+        if stderr_buffer:
+            for line in stderr_buffer.splitlines():
+                print_samlog_line("stderr", line)
+        channel.close()
+        if sys.stdout.isatty():
+            print()
+
+
 def full_setup(r: RemoteRunner, cfg: dict):
     verify_remote(r)
     ensure_megacmd(r)
     bootstrap_workspace(r, cfg)
     build_env(r, cfg)
     patch_repo_for_t4(r, cfg)
+    patch_repo_for_low_ram(r, cfg)
     cache_checkpoint(r, cfg)
     generate_manifest(r, cfg)
     upload_pipeline(r)
@@ -797,9 +908,10 @@ def parse_args():
     parser.add_argument("--remote-miniforge", dest="remote_miniforge")
     parser.add_argument("--refresh-seconds", type=float, default=2.0, help="Refresh interval for samtop.")
     parser.add_argument("--once", action="store_true", help="Render samtop once and exit.")
+    parser.add_argument("--lines", type=int, default=80, help="How many existing log lines samlog should show before following.")
     parser.add_argument(
         "command",
-        choices=["verify", "setup", "upload-pipeline", "launch", "status", "samtop", "full"],
+        choices=["verify", "setup", "upload-pipeline", "launch", "status", "samtop", "samlog", "full"],
         help="Which automation step to run.",
     )
     return parser.parse_args()
@@ -824,6 +936,8 @@ def main():
             show_status(runner)
         elif args.command == "samtop":
             run_samtop(runner, cfg, refresh_seconds=max(args.refresh_seconds, 0.5), once=args.once)
+        elif args.command == "samlog":
+            run_samlog(runner, cfg, lines=args.lines)
         elif args.command == "full":
             full_setup(runner, cfg)
             launch_pipeline(runner)

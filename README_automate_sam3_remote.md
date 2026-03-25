@@ -20,6 +20,7 @@ It can:
 - launch the 2-worker GPU pipeline
 - show pipeline status
 - show a live `samtop` terminal dashboard with queue and worker progress
+- stream combined worker logs with `samlog`
 
 ## Files Used
 
@@ -34,6 +35,7 @@ These are uploaded to the remote notebook when needed.
 For local terminal monitoring, this repo also includes:
 
 - [samtop.bat](C:/Users/Hamim%20Mahmud/Documents/SAM3-agent/samtop.bat)
+- [samlog.bat](C:/Users/Hamim%20Mahmud/Documents/SAM3-agent/samlog.bat)
 
 ## Requirements
 
@@ -157,6 +159,28 @@ python automate_sam3_remote.py samtop --once
 ```
 
 Press `q` to quit the live view.
+
+### 8. Samlog
+
+Streams the remote worker logs in one terminal view with a prefix per worker.
+
+Run it directly through Python:
+
+```bash
+python automate_sam3_remote.py samlog --password YOUR_SSH_PASSWORD
+```
+
+Or from this repo in PowerShell / `cmd`:
+
+```bash
+samlog
+```
+
+Helpful option:
+
+```bash
+python automate_sam3_remote.py samlog --lines 200
+```
 
 ## .env Mode
 

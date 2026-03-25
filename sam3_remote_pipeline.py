@@ -3,11 +3,13 @@ import argparse
 import fcntl
 import gzip
 import json
+import logging
 import os
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,16 +32,29 @@ MINIFORGE_ROOT = Path("/kaggle/working/miniforge3")
 ENV_PREFIX = MINIFORGE_ROOT / "envs" / "sam3"
 MEGA_ROOT = "/SAM3"
 MEGA_RESULTS_ROOT = "/SAM3/results"
-PROMPTS = ["vehicle", "person", "animal", "road", "building", "wheel"]
-CHUNK_FRAMES = 4
+PROMPTS = ["vehicle", "person", "animal", "road", "building", "wheel","Footpath"]
+CHUNK_FRAMES = 200
 LOW_DISK_BYTES = 4 * 1024**3
 CHECKPOINT_PATH = "/root/.cache/huggingface/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt"
 BPE_PATH = "/kaggle/working/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz"
 HOSTNAME = socket.gethostname()
+LOGGER = logging.getLogger("sam3_pipeline")
+_FFMPEG_NVENC_AVAILABLE = None
 
 
 def iso_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def configure_logging(context: str):
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)sZ | {context} | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
+    LOGGER.info("logging initialized host=%s pid=%s", HOSTNAME, os.getpid())
 
 
 def safe_name(name: str) -> str:
@@ -63,12 +78,53 @@ def run_cmd(args, check=True, capture=False, env=None):
         kwargs["stderr"] = subprocess.PIPE
     proc = subprocess.run(args, env=env, **kwargs)
     if check and proc.returncode != 0:
+        LOGGER.error("command failed rc=%s cmd=%s", proc.returncode, " ".join(map(str, args)))
         raise RuntimeError(
             f"command failed ({proc.returncode}): {args}\n"
             f"stdout={getattr(proc, 'stdout', '')}\n"
             f"stderr={getattr(proc, 'stderr', '')}"
         )
     return proc
+
+
+def ffmpeg_nvenc_available() -> bool:
+    global _FFMPEG_NVENC_AVAILABLE
+    if _FFMPEG_NVENC_AVAILABLE is None:
+        proc = run_cmd(["ffmpeg", "-hide_banner", "-encoders"], check=False, capture=True)
+        encoders_text = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+        _FFMPEG_NVENC_AVAILABLE = proc.returncode == 0 and "h264_nvenc" in encoders_text
+        LOGGER.info("ffmpeg nvenc available=%s", _FFMPEG_NVENC_AVAILABLE)
+    return _FFMPEG_NVENC_AVAILABLE
+
+
+def build_ffmpeg_convert_args(dav_path: Path, mp4_path: Path, use_gpu: bool) -> list[str]:
+    args = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(dav_path),
+        "-an",
+        "-vf",
+        "fps=15",
+    ]
+    if use_gpu:
+        args.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20"])
+    else:
+        args.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "20"])
+    args.extend(
+        [
+            "-g",
+            str(CHUNK_FRAMES),
+            "-keyint_min",
+            str(CHUNK_FRAMES),
+            "-sc_threshold",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            str(mp4_path),
+        ]
+    )
+    return args
 
 
 def mega_exists(remote_path: str) -> bool:
@@ -482,7 +538,60 @@ def probe_duration_seconds(path: Path) -> float | None:
         return None
 
 
+def probe_frame_count(path: Path) -> int | None:
+    proc = run_cmd(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        check=False,
+        capture=True,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        return int((proc.stdout or "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def chunks_need_regeneration(chunk_files: list[Path]) -> bool:
+    if not chunk_files:
+        return True
+    if len(chunk_files) == 1:
+        LOGGER.warning("chunk validation failed reason=single_chunk")
+        return True
+    for index, chunk_file in enumerate(chunk_files):
+        frame_count = probe_frame_count(chunk_file)
+        if frame_count is None:
+            LOGGER.warning("chunk validation failed reason=missing_frame_count chunk=%s", chunk_file)
+            return True
+        if frame_count > CHUNK_FRAMES:
+            LOGGER.warning(
+                "chunk validation failed reason=oversized_chunk chunk=%s frames=%s max=%s",
+                index,
+                frame_count,
+                CHUNK_FRAMES,
+            )
+            return True
+    return False
+
+
 def run_ffmpeg_with_progress(args, manifest_index: int, total_seconds: float | None):
+    LOGGER.info(
+        "ffmpeg conversion started manifest_index=%s total_seconds=%s",
+        manifest_index,
+        round(total_seconds, 1) if total_seconds else None,
+    )
     proc = subprocess.Popen(
         args + ["-progress", "pipe:1", "-nostats"],
         stdout=subprocess.PIPE,
@@ -504,6 +613,13 @@ def run_ffmpeg_with_progress(args, manifest_index: int, total_seconds: float | N
             if total_seconds and total_seconds > 0:
                 progress_pct = min((elapsed_seconds / total_seconds) * 100.0, 100.0)
             if progress_pct - last_pct >= 1.0 or progress_pct >= 100.0:
+                LOGGER.info(
+                    "conversion progress manifest_index=%s pct=%.1f elapsed=%.1fs total=%s",
+                    manifest_index,
+                    progress_pct,
+                    elapsed_seconds,
+                    round(total_seconds, 1) if total_seconds else None,
+                )
                 note_preprocessing_state(
                     manifest_index,
                     status="converting",
@@ -521,6 +637,7 @@ def run_ffmpeg_with_progress(args, manifest_index: int, total_seconds: float | N
             proc.stderr.close()
     if return_code != 0:
         raise RuntimeError(f"ffmpeg failed ({return_code}): {' '.join(args)}\n{stderr_text}")
+    LOGGER.info("ffmpeg conversion finished manifest_index=%s", manifest_index)
 
 
 def note_prompt_start(manifest_index, prompt):
@@ -607,9 +724,11 @@ def ensure_local_video_assets(item):
     dav_path = video_dir / item["filename"]
     mp4_path = video_dir / f"{video_key}_15fps.mp4"
     if not dav_path.exists():
+        LOGGER.info("downloading dav manifest_index=%s file=%s", item["manifest_index"], item["filename"])
         note_preprocessing_state(item["manifest_index"], status="downloading_dav")
         run_cmd(["gdown", f"https://drive.google.com/uc?id={item['source_id']}", "-O", str(dav_path)])
         note_preprocessing_state(item["manifest_index"], status="downloaded_dav", downloaded_at=iso_now())
+        LOGGER.info("downloaded dav manifest_index=%s path=%s", item["manifest_index"], dav_path)
     if not mp4_path.exists():
         total_seconds = probe_duration_seconds(dav_path)
         note_preprocessing_state(
@@ -619,15 +738,53 @@ def ensure_local_video_assets(item):
             conversion_elapsed_seconds=0.0,
             conversion_total_seconds=round(total_seconds, 1) if total_seconds else None,
         )
-        run_ffmpeg_with_progress(
+        use_gpu_ffmpeg = ffmpeg_nvenc_available()
+        try:
+            LOGGER.info(
+                "starting ffmpeg conversion manifest_index=%s mode=%s",
+                item["manifest_index"],
+                "gpu-nvenc" if use_gpu_ffmpeg else "cpu-libx264",
+            )
+            run_ffmpeg_with_progress(
+                build_ffmpeg_convert_args(dav_path, mp4_path, use_gpu=use_gpu_ffmpeg),
+                item["manifest_index"],
+                total_seconds,
+            )
+        except Exception:
+            if not use_gpu_ffmpeg:
+                raise
+            LOGGER.warning(
+                "gpu ffmpeg conversion failed; retrying on cpu manifest_index=%s",
+                item["manifest_index"],
+                exc_info=True,
+            )
+            run_ffmpeg_with_progress(
+                build_ffmpeg_convert_args(dav_path, mp4_path, use_gpu=False),
+                item["manifest_index"],
+                total_seconds,
+            )
+        note_preprocessing_state(item["manifest_index"], status="converted", conversion_progress_pct=100.0)
+        LOGGER.info("converted mp4 manifest_index=%s path=%s", item["manifest_index"], mp4_path)
+    chunk_files = sorted(chunk_dir.glob("chunk_*.mp4"))
+    if chunks_need_regeneration(chunk_files):
+        if chunk_files:
+            LOGGER.info(
+                "regenerating invalid chunks manifest_index=%s chunk_dir=%s existing=%s",
+                item["manifest_index"],
+                chunk_dir,
+                len(chunk_files),
+            )
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("segmenting chunks manifest_index=%s output_dir=%s", item["manifest_index"], chunk_dir)
+        note_preprocessing_state(item["manifest_index"], status="segmenting")
+        run_cmd(
             [
                 "ffmpeg",
                 "-y",
                 "-i",
-                str(dav_path),
+                str(mp4_path),
                 "-an",
-                "-vf",
-                "fps=15",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -640,46 +797,45 @@ def ensure_local_video_assets(item):
                 str(CHUNK_FRAMES),
                 "-sc_threshold",
                 "0",
+                "-force_key_frames",
+                f"expr:gte(t,n_forced*{CHUNK_FRAMES / 15.0:.6f})",
                 "-pix_fmt",
                 "yuv420p",
-                str(mp4_path),
-            ],
-            item["manifest_index"],
-            total_seconds,
-        )
-        note_preprocessing_state(item["manifest_index"], status="converted", conversion_progress_pct=100.0)
-    chunk_files = sorted(chunk_dir.glob("chunk_*.mp4"))
-    if not chunk_files:
-        note_preprocessing_state(item["manifest_index"], status="segmenting")
-        run_cmd(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(mp4_path),
-                "-c",
-                "copy",
-                "-map",
-                "0:v:0",
                 "-f",
                 "segment",
-                "-segment_frames",
-                str(CHUNK_FRAMES),
+                "-segment_time",
+                f"{CHUNK_FRAMES / 15.0:.6f}",
+                "-segment_time_delta",
+                "0.05",
+                "-segment_format",
+                "mp4",
                 "-reset_timestamps",
                 "1",
                 str(chunk_dir / "chunk_%04d.mp4"),
             ]
         )
         chunk_files = sorted(chunk_dir.glob("chunk_*.mp4"))
-    if not chunk_files:
+    if chunks_need_regeneration(chunk_files):
         raise RuntimeError(f"no chunks created for {mp4_path}")
     note_preprocessing(item["manifest_index"], dav_path, mp4_path, chunk_dir, len(chunk_files))
     note_preprocessing_state(item["manifest_index"], status="ready")
+    LOGGER.info(
+        "video assets ready manifest_index=%s chunk_count=%s chunk_dir=%s",
+        item["manifest_index"],
+        len(chunk_files),
+        chunk_dir,
+    )
     return dav_path, mp4_path, chunk_dir, chunk_files
 
 
 def make_predictor():
-    return Sam3VideoPredictor(compile=False, checkpoint_path=CHECKPOINT_PATH, bpe_path=BPE_PATH)
+    return Sam3VideoPredictor(
+        compile=False,
+        checkpoint_path=CHECKPOINT_PATH,
+        bpe_path=BPE_PATH,
+        async_loading_frames=False,
+        video_loader_type="cv2",
+    )
 
 
 def encode_masks(masks):
@@ -688,6 +844,22 @@ def encode_masks(masks):
         rle = mask_utils.encode(np.asfortranarray(mask.astype(np.uint8)))
         encoded.append({"size": rle["size"], "counts": rle["counts"].decode("ascii")})
     return encoded
+
+
+def to_jsonable(value):
+    if isinstance(value, dict):
+        return {str(key): to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return to_jsonable(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    if hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
+        converted = value.tolist()
+        if converted is not value:
+            return to_jsonable(converted)
+    return value
 
 
 def run_chunk(predictor, chunk_path: Path, prompt: str):
@@ -707,14 +879,16 @@ def run_chunk(predictor, chunk_path: Path, prompt: str):
         ):
             outputs = item["outputs"]
             frames.append(
-                {
+                to_jsonable(
+                    {
                     "frame_index": int(item["frame_index"]),
                     "obj_ids": outputs["out_obj_ids"].tolist(),
                     "probs": np.asarray(outputs["out_probs"]).tolist(),
                     "boxes_xywh": np.asarray(outputs["out_boxes_xywh"]).tolist(),
                     "mask_rles": encode_masks(np.asarray(outputs["out_binary_masks"])),
                     "frame_stats": outputs.get("frame_stats"),
-                }
+                    }
+                )
             )
         return frames
     finally:
@@ -740,6 +914,14 @@ def write_chunk_result(item, prompt, chunk_index, chunk_file, frames):
         json.dump(payload, handle)
     remote_dir = f"{MEGA_RESULTS_ROOT}/{video_key}/{prompt}"
     mega_upload(out_path, remote_dir)
+    LOGGER.info(
+        "uploaded chunk manifest_index=%s prompt=%s chunk=%s frames=%s remote_dir=%s",
+        item["manifest_index"],
+        prompt,
+        chunk_index,
+        len(frames),
+        remote_dir,
+    )
     return f"{remote_dir}/chunk_{chunk_index:04d}.json.gz"
 
 
@@ -750,10 +932,18 @@ def cleanup_video_assets(dav_path, mp4_path, chunk_dir):
             path.unlink()
     if Path(chunk_dir).exists():
         shutil.rmtree(chunk_dir, ignore_errors=True)
+    LOGGER.info("cleaned local assets dav=%s mp4=%s chunk_dir=%s", dav_path, mp4_path, chunk_dir)
 
 
 def process_item(worker_name, item):
+    LOGGER.info(
+        "process item start worker=%s manifest_index=%s file=%s",
+        worker_name,
+        item["manifest_index"],
+        item["filename"],
+    )
     if disk_low():
+        LOGGER.warning("disk low before processing manifest_index=%s", item["manifest_index"])
         release_item(worker_name, item["manifest_index"], final_status=item["status"], stop_reason="low_disk")
         return False
     dav_path, mp4_path, chunk_dir, chunk_files = ensure_local_video_assets(item)
@@ -762,20 +952,60 @@ def process_item(worker_name, item):
         for prompt in PROMPTS:
             pstate = item["prompts"][prompt]
             if pstate["status"] == "completed":
+                LOGGER.info("skip completed prompt manifest_index=%s prompt=%s", item["manifest_index"], prompt)
                 continue
+            LOGGER.info(
+                "prompt start worker=%s manifest_index=%s prompt=%s chunk_count=%s",
+                worker_name,
+                item["manifest_index"],
+                prompt,
+                len(chunk_files),
+            )
             note_prompt_start(item["manifest_index"], prompt)
             for chunk_index, chunk_file in enumerate(chunk_files):
                 heartbeat(worker_name)
                 if chunk_index in pstate["completed_chunks"]:
+                    LOGGER.info(
+                        "skip completed chunk manifest_index=%s prompt=%s chunk=%s",
+                        item["manifest_index"],
+                        prompt,
+                        chunk_index,
+                    )
                     continue
                 if disk_low():
+                    LOGGER.warning(
+                        "disk low mid-run manifest_index=%s prompt=%s chunk=%s",
+                        item["manifest_index"],
+                        prompt,
+                        chunk_index,
+                    )
                     release_item(worker_name, item["manifest_index"], final_status="pending", stop_reason="low_disk")
                     return False
                 try:
+                    LOGGER.info(
+                        "chunk start manifest_index=%s prompt=%s chunk=%s file=%s",
+                        item["manifest_index"],
+                        prompt,
+                        chunk_index,
+                        chunk_file.name,
+                    )
                     frames = run_chunk(predictor, chunk_file, prompt)
                     remote_path = write_chunk_result(item, prompt, chunk_index, chunk_file, frames)
                     note_chunk_upload(item["manifest_index"], prompt, chunk_index, remote_path)
+                    LOGGER.info(
+                        "chunk complete manifest_index=%s prompt=%s chunk=%s remote_path=%s",
+                        item["manifest_index"],
+                        prompt,
+                        chunk_index,
+                        remote_path,
+                    )
                 except Exception as exc:
+                    LOGGER.exception(
+                        "chunk failed manifest_index=%s prompt=%s chunk=%s",
+                        item["manifest_index"],
+                        prompt,
+                        chunk_index,
+                    )
                     note_prompt_failure(
                         item["manifest_index"],
                         prompt,
@@ -784,8 +1014,10 @@ def process_item(worker_name, item):
                     )
                     raise
             note_prompt_complete(item["manifest_index"], prompt)
+            LOGGER.info("prompt complete manifest_index=%s prompt=%s", item["manifest_index"], prompt)
         release_item(worker_name, item["manifest_index"], final_status="completed")
         cleanup_video_assets(dav_path, mp4_path, chunk_dir)
+        LOGGER.info("process item complete worker=%s manifest_index=%s", worker_name, item["manifest_index"])
         return True
     finally:
         del predictor
@@ -795,15 +1027,20 @@ def worker_loop(worker_name, gpu):
     ensure_dirs()
     ensure_mega_layout()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    LOGGER.info("worker loop start worker=%s gpu=%s", worker_name, gpu)
     while True:
         item, _session = claim_next_item(worker_name)
         if item is None:
+            LOGGER.info("no more work available worker=%s", worker_name)
             break
+        LOGGER.info("claimed item worker=%s manifest_index=%s file=%s", worker_name, item["manifest_index"], item["filename"])
         try:
             ok = process_item(worker_name, item)
             if not ok:
+                LOGGER.warning("worker exiting early worker=%s", worker_name)
                 break
         except Exception as exc:
+            LOGGER.exception("worker error worker=%s manifest_index=%s", worker_name, item["manifest_index"])
             release_item(
                 worker_name,
                 item["manifest_index"],
@@ -811,6 +1048,7 @@ def worker_loop(worker_name, gpu):
                 error_text="".join(traceback.format_exception(exc)).strip(),
             )
             continue
+    LOGGER.info("worker loop exit worker=%s", worker_name)
 
 
 def pid_alive(pid):
@@ -835,6 +1073,7 @@ def start_worker_subprocess(worker_name, gpu):
             return existing
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env["PYTHONUNBUFFERED"] = "1"
     cmd = [
         str(ENV_PREFIX / "bin" / "python"),
         str(WORKSPACE_ROOT / "sam3_remote_pipeline.py"),
@@ -854,6 +1093,7 @@ def start_worker_subprocess(worker_name, gpu):
             start_new_session=True,
         )
     pid_path.write_text(str(proc.pid), encoding="utf-8")
+    LOGGER.info("started worker subprocess worker=%s gpu=%s pid=%s log=%s", worker_name, gpu, proc.pid, log_path)
     return proc.pid
 
 
@@ -863,6 +1103,7 @@ def launch():
     session = load_or_init_session()
     save_session(session)
     PIPELINE_PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
+    LOGGER.info("launch requested pipeline_pid=%s", os.getpid())
     pid_a = start_worker_subprocess("worker_a", 0)
     pid_b = start_worker_subprocess("worker_b", 1)
     print(json.dumps({"worker_a": pid_a, "worker_b": pid_b}, indent=2))
@@ -876,10 +1117,12 @@ def status():
         data[worker_name] = {"pid": pid, "alive": pid_alive(pid)}
     if SESSION_PATH.exists():
         data["session"] = json.loads(SESSION_PATH.read_text(encoding="utf-8")).get("summary", {})
+    LOGGER.info("status requested")
     print(json.dumps(data, indent=2))
 
 
 def stop():
+    LOGGER.info("stop requested")
     for worker_name in ["worker_a", "worker_b"]:
         pid_path = worker_pid_path(worker_name)
         if not pid_path.exists():
@@ -904,6 +1147,10 @@ def main():
     sub.add_parser("status")
     sub.add_parser("stop")
     args = parser.parse_args()
+    context = args.cmd
+    if args.cmd == "worker":
+        context = args.worker_name
+    configure_logging(context)
     if args.cmd == "worker":
         worker_loop(args.worker_name, args.gpu)
     elif args.cmd == "launch":
