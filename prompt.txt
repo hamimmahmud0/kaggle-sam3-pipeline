@@ -1,0 +1,226 @@
+# Initial prompt
+
+<Tunnel-Prompt>
+
+- install megaCMD if not installed
+- wait for user to confirm login then proceed to next step
+- spawn a subagent to setup SAM3 installing new conda environment. HF_TOKEN = `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`
+- Spawn a subagent to make a list of dav file in drive folder `<drive-link>`with file name
+- Wait for subagents to finish
+- check if there is any file named `session.json` in mega drive. If not this is the first session
+- convert the dav file to 15fps using ffmpeg dropping excess frame
+- perform inference sequentially for each video and save result in mega in `SAM3` folder. (Make folder if doesn't exist) for each frame for each of the following prompt. (Go untill there is no space left. Update session file such a way to that if server and mega drive is changed new agent can continue from where is left off. Save a prompt for next agent in prompt.txt):
+    - vehicle
+    - person
+    - animal
+    - road
+    - building
+    - wheel
+
+preferred folder structure in mega drive:
+SAM3
+    - session.json
+    - prompt.txt
+    - results/
+
+
+# resumability prompt
+
+You are starting with no prior context. Recreate the remote SAM3 environment and convert the pipeline into a 2-worker production setup that uses both GPUs safely.
+
+Objective:
+- Build or restore a resumable SAM3 processing pipeline on the remote notebook.
+- Use two independent single-GPU workers in production:
+  - Worker A on GPU 0
+  - Worker B on GPU 1
+- Do not use the repo's built-in distributed multi-GPU predictor for production.
+- Keep all progress resumable through MEGA so another fresh agent can continue later.
+
+Remote connection details:
+- Transport: SSH through a local proxy
+- Host: `127.0.0.1`
+- Port: `10022`
+- Username: `notebook`
+- Password: use the password already available in the workspace/user request history
+- Strict host key checking should be disabled or auto-accepted
+
+First verification commands:
+```bash
+python --version
+pwd
+nvidia-smi
+```
+
+Expected remote notebook layout:
+- Working directory root: `/kaggle/working`
+- SAM3 workspace root: `/kaggle/working/SAM3`
+- SAM3 repo checkout: `/kaggle/working/sam3`
+- Conda/micromamba root: `/kaggle/working/miniforge3`
+
+Current data sources and destinations:
+- Google Drive folder manifest is already prepared locally/remotely
+- Remote manifest path: `/kaggle/working/SAM3/dav_files_manifest.json`
+- MEGA root folder: `/SAM3`
+- MEGA expected layout:
+```text
+/SAM3
+  /session.json
+  /prompt.txt
+  /results/
+```
+
+Video prompts to run for every video:
+- `vehicle`
+- `person`
+- `animal`
+- `road`
+- `building`
+- `wheel`
+
+Environment reconstruction steps:
+1. Connect to the remote notebook over SSH.
+2. Verify whether these exist:
+   - `/kaggle/working/sam3`
+   - `/kaggle/working/miniforge3`
+   - `/kaggle/working/SAM3`
+   - `/kaggle/working/SAM3/dav_files_manifest.json`
+3. Verify tools:
+   - `mega-whoami`
+   - `ffmpeg`
+   - `gdown`
+   - `nvidia-smi`
+4. If MEGA is not authenticated, stop and obtain authentication before continuing.
+5. Activate the SAM3 environment:
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export MAMBA_ROOT_PREFIX=/kaggle/working/miniforge3
+source <(/kaggle/working/miniforge3/micromamba shell hook -s bash)
+micromamba activate sam3
+```
+6. If the `sam3` env does not exist, recreate it under `/kaggle/working/miniforge3/envs/sam3` and ensure SAM3 can import successfully.
+7. Verify that the Hugging Face checkpoint can be loaded by the repo.
+
+Known SAM3 compatibility notes:
+- The repo may try to use `bfloat16` autocast on GPUs that do not support it cleanly. If needed, patch the runtime to fall back to `float16`.
+- The repo's built-in distributed multi-GPU predictor path was not reliable for this workload and hit OOM/failure conditions.
+- Production should use two independent single-GPU workers instead.
+
+Production pipeline requirements:
+- Process the manifest sequentially in terms of global task ownership, but allow two workers to run different tasks at the same time.
+- Convert each DAV file to 15 fps using ffmpeg.
+- Split each converted MP4 into 200-frame chunks to stay within Tesla T4 memory limits.
+- Run SAM3 inference for each prompt.
+- Save results to MEGA under `/SAM3/results`.
+- Maintain `/SAM3/session.json` and `/SAM3/prompt.txt` in MEGA.
+- Ensure a fresh future agent can resume from the saved MEGA state alone.
+
+Session and resumability requirements:
+- `session.json` must contain enough information to know:
+  - manifest index
+  - filename
+  - source URL / id
+  - prompt completion state
+  - failed prompts
+  - uploaded result paths
+  - currently claimed task
+  - summary counts
+  - stop reason
+- `prompt.txt` in MEGA must contain a short resume handoff for the next agent.
+- Every meaningful state change must be synced back to MEGA.
+
+Two-worker production design:
+- Worker A:
+  - `CUDA_VISIBLE_DEVICES=0`
+  - claims one available task from session state
+- Worker B:
+  - `CUDA_VISIBLE_DEVICES=1`
+  - claims a different available task
+- Task claiming must be atomic enough that both workers cannot take the same unit of work.
+- Acceptable approaches:
+  - file lock around session mutation
+  - lock file in `/kaggle/working/SAM3`
+  - another safe atomic claim/update mechanism
+
+Task granularity:
+- Recommended claim unit:
+  - one manifest item plus one prompt
+  - or one manifest item with internal prompt ownership tracked carefully
+- Avoid duplicate uploads and duplicate work.
+
+Cleanup requirements:
+- After successful upload, remove local temporary files where safe:
+  - downloaded `.dav`
+  - converted `.mp4`
+  - temporary chunk files
+- If low disk space is detected, stop cleanly and checkpoint state.
+
+Benchmark facts you should trust:
+- Single-GPU runtime for one 200-frame chunk was about `663.52s` to `669.89s`.
+- Two independent single-GPU workers processed two 200-frame chunks in `676.31s` wall-clock.
+- This is about `1.97x` throughput improvement over one GPU running the two chunks sequentially.
+- Built-in SAM3 multi-GPU was not a good production option for this workload.
+
+What to inspect first on the remote side:
+```bash
+ls -la /kaggle/working
+ls -la /kaggle/working/SAM3
+ls -la /kaggle/working/sam3
+mega-whoami
+mega-ls /SAM3
+python - <<'PY'
+import json
+from pathlib import Path
+p = Path('/kaggle/working/SAM3/session.json')
+print('exists', p.exists())
+if p.exists():
+    s = json.loads(p.read_text(encoding='utf-8'))
+    print('current', s.get('current'))
+    print('summary', s.get('summary'))
+PY
+```
+
+Key remote files that may already exist:
+```text
+/kaggle/working/SAM3/sam3_remote_pipeline.py
+/kaggle/working/SAM3/benchmark_sam3_remote.py
+/kaggle/working/SAM3/run_pipeline.sh
+/kaggle/working/SAM3/dav_files_manifest.json
+/kaggle/working/SAM3/session.json
+/kaggle/working/SAM3/logs/pipeline.log
+/kaggle/working/SAM3/pipeline.pid
+```
+
+If files are missing:
+- Recreate them from the repo/workspace as needed.
+- Prefer preserving existing MEGA session state over starting from scratch.
+
+Implementation target:
+- A launcher or supervisor that starts two workers.
+- Each worker activates the env, pins itself to one GPU, claims work, runs chunked inference, uploads results, updates session state, and repeats.
+- The launcher should be restartable.
+
+Verification checklist:
+1. Both GPUs are being used by separate production workers.
+2. Workers are processing different tasks.
+3. Session state remains valid and synchronized to MEGA.
+4. Results appear under `/SAM3/results`.
+5. Killing and restarting the launcher does not lose progress.
+
+Useful monitoring commands:
+```bash
+ps -ef | grep -E "sam3_remote_pipeline|run_pipeline|worker" | grep -v grep
+nvidia-smi
+tail -n 120 /kaggle/working/SAM3/logs/pipeline.log
+mega-ls /SAM3
+mega-ls /SAM3/results
+```
+
+Failure handling:
+- If a worker crashes, log the error into session state and continue with other unclaimed work when safe.
+- If both workers are down, the next fresh agent must be able to read the saved session and restart them.
+- If MEGA sync fails, avoid silently continuing without checkpointing.
+
+Success condition:
+- The remote environment is fully recreated or verified.
+- Two independent single-GPU production workers are running.
+- The workflow is resumable from MEGA-backed state by a fresh agent with no prior context.
