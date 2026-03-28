@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import fcntl
 import gzip
 import json
 import os
@@ -11,6 +10,12 @@ import subprocess
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+    import msvcrt
 
 import numpy as np
 from pycocotools import mask as mask_utils
@@ -338,10 +343,29 @@ def update_worker(session, worker_name, status=None, claimed_task=None, pid=None
     worker["last_heartbeat"] = iso_now()
 
 
+def lock_handle(handle):
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return
+    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+
+
+def unlock_handle(handle):
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def session_lock():
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     handle = LOCK_PATH.open("a+", encoding="utf-8")
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    if handle.tell() == 0:
+        handle.write("\n")
+        handle.flush()
+    handle.seek(0)
+    lock_handle(handle)
     return handle
 
 
@@ -380,7 +404,7 @@ def claim_next_item(worker_name):
         save_session(session)
         return None, session
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        unlock_handle(handle)
         handle.close()
 
 
@@ -398,7 +422,7 @@ def heartbeat(worker_name):
         )
         save_session(session)
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        unlock_handle(handle)
         handle.close()
 
 
@@ -419,7 +443,7 @@ def release_item(worker_name, manifest_index, final_status=None, stop_reason=Non
         session["current"]["claimed_tasks"].pop(worker_name, None)
         save_session(session)
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        unlock_handle(handle)
         handle.close()
 
 
@@ -441,7 +465,7 @@ def note_preprocessing(manifest_index, dav_path, mp4_path, chunk_dir, chunk_coun
             item["prompts"][prompt]["chunk_count"] = chunk_count
         save_session(session)
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        unlock_handle(handle)
         handle.close()
 
 
@@ -457,7 +481,7 @@ def note_prompt_start(manifest_index, prompt):
         pstate["last_error"] = None
         save_session(session)
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        unlock_handle(handle)
         handle.close()
 
 
@@ -476,7 +500,7 @@ def note_chunk_upload(manifest_index, prompt, chunk_index, remote_path):
             pstate["failed_chunks"].remove(chunk_index)
         save_session(session)
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        unlock_handle(handle)
         handle.close()
 
 
@@ -492,7 +516,7 @@ def note_prompt_complete(manifest_index, prompt):
             item["status"] = "completed"
         save_session(session)
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        unlock_handle(handle)
         handle.close()
 
 
@@ -511,7 +535,7 @@ def note_prompt_failure(manifest_index, prompt, chunk_index, message):
         item.setdefault("errors", []).append({"at": iso_now(), "message": f"{prompt}: {message}"})
         save_session(session)
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        unlock_handle(handle)
         handle.close()
 
 

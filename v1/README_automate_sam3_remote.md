@@ -1,6 +1,6 @@
 # Remote SAM3 Automation
 
-This document explains how to use [automate_sam3_remote.py](C:/Users/Hamim%20Mahmud/Documents/SAM3-agent/automate_sam3_remote.py).
+This document explains how to use `automate_sam3_remote.py`.
 
 ## What It Does
 
@@ -25,15 +25,16 @@ It can:
 
 The script depends on these local files:
 
-- [automate_sam3_remote.py](C:/Users/Hamim%20Mahmud/Documents/SAM3-agent/automate_sam3_remote.py)
-- [sam3_remote_pipeline.py](C:/Users/Hamim%20Mahmud/Documents/SAM3-agent/sam3_remote_pipeline.py)
-- [run_pipeline.sh](C:/Users/Hamim%20Mahmud/Documents/SAM3-agent/run_pipeline.sh)
+- `automate_sam3_remote.py`
+- `sam3_remote_pipeline.py`
+- `run_pipeline.sh`
 
 These are uploaded to the remote notebook when needed.
 
 For local terminal monitoring, this repo also includes:
 
-- [samtop.bat](C:/Users/Hamim%20Mahmud/Documents/SAM3-agent/samtop.bat)
+- `samtop.bat` for Windows
+- `samtop.sh` for Ubuntu/Linux
 
 ## Requirements
 
@@ -142,7 +143,14 @@ Run it directly through Python:
 python automate_sam3_remote.py samtop --password YOUR_SSH_PASSWORD
 ```
 
-Or from this repo in PowerShell / `cmd`:
+Or from this repo on Ubuntu/Linux:
+
+```bash
+chmod +x samtop.sh
+./samtop.sh
+```
+
+Or on Windows in PowerShell / `cmd`:
 
 ```bash
 samtop
