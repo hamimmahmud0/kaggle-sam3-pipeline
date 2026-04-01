@@ -41,6 +41,14 @@ MEGA_ROOT = "/SAM3"
 MEGA_RESULTS_ROOT = "/SAM3/results"
 PROMPTS = ["vehicle", "person", "animal", "road", "building", "wheel","Footpath"]
 CHUNK_FRAMES = int(os.environ.get("SAM3_CHUNK_FRAMES", "100"))
+INFERENCE_BATCH_SIZE = int(
+    os.environ.get(
+        "SAM3_INFERENCE_BATCH_SIZE",
+        os.environ.get("SAM3_PROPAGATE_VIDEO_FRAME_COUNT", str(CHUNK_FRAMES)),
+    )
+)
+LOW_MEMORY_CHUNK_FRAMES = int(os.environ.get("SAM3_LOW_MEMORY_CHUNK_FRAMES", "50"))
+LOW_MEMORY_MIN_CHUNK_FRAMES = int(os.environ.get("SAM3_LOW_MEMORY_MIN_CHUNK_FRAMES", "12"))
 LOW_DISK_BYTES = 4 * 1024**3
 CHECKPOINT_PATH = "/root/.cache/huggingface/hub/models--facebook--sam3/snapshots/3c879f39826c281e95690f02c7821c4de09afae7/sam3.pt"
 BPE_PATH = "/kaggle/working/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz"
@@ -522,6 +530,57 @@ def release_item(worker_name, manifest_index, final_status=None, stop_reason=Non
         handle.close()
 
 
+def retry_failed():
+    handle = session_lock()
+    try:
+        session = load_or_init_session()
+        retried_items = 0
+        retried_prompts = 0
+        retried_chunks = 0
+
+        for item in session["items"]:
+            item_had_failure = item.get("status") == "failed"
+            item["claim"] = None
+            item["stop_reason"] = None
+
+            for prompt in PROMPTS:
+                pstate = item["prompts"][prompt]
+                if pstate.get("status") != "failed":
+                    continue
+                retried_prompts += 1
+                retried_chunks += len(pstate.get("failed_chunks", []))
+                pstate["status"] = "pending"
+                pstate["failed_chunks"] = []
+                pstate["last_error"] = None
+                pstate["completed_at"] = None
+                item_had_failure = True
+
+            if item_had_failure:
+                retried_items += 1
+                item["status"] = "pending"
+
+        session["stop_reason"] = None
+        session["current"]["claimed_tasks"] = {}
+        for worker_name in ["worker_a", "worker_b"]:
+            update_worker(session, worker_name, status="idle", claimed_task=None)
+
+        save_session(session)
+    finally:
+        unlock_handle(handle)
+        handle.close()
+
+    print(
+        json.dumps(
+            {
+                "retried_items": retried_items,
+                "retried_prompts": retried_prompts,
+                "retried_failed_chunks": retried_chunks,
+            },
+            indent=2,
+        )
+    )
+
+
 def note_preprocessing(manifest_index, dav_path, mp4_path, chunk_dir, chunk_count):
     handle = session_lock()
     try:
@@ -895,6 +954,12 @@ def make_predictor():
     )
 
 
+def is_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    return "cuda out of memory" in str(exc).lower()
+
+
 def encode_masks(masks):
     encoded = []
     for mask in masks:
@@ -919,7 +984,7 @@ def to_jsonable(value):
     return value
 
 
-def run_chunk(predictor, chunk_path: Path, prompt: str):
+def run_chunk(predictor, chunk_path: Path, prompt: str, max_frames_to_track: int):
     response = predictor.handle_request({"type": "start_session", "resource_path": str(chunk_path)})
     session_id = response["session_id"]
     try:
@@ -931,7 +996,7 @@ def run_chunk(predictor, chunk_path: Path, prompt: str):
                 "session_id": session_id,
                 "propagation_direction": "forward",
                 "start_frame_index": 0,
-                "max_frame_num_to_track": CHUNK_FRAMES,
+                "max_frame_num_to_track": max_frames_to_track,
             }
         ):
             outputs = item["outputs"]
@@ -953,6 +1018,106 @@ def run_chunk(predictor, chunk_path: Path, prompt: str):
             predictor.handle_request({"type": "close_session", "session_id": session_id})
         finally:
             release_cuda_memory()
+
+
+def build_low_memory_chunk_files(chunk_path: Path, frames_per_chunk: int) -> tuple[Path, list[Path]]:
+    retry_dir = chunk_path.parent / f"{chunk_path.stem}_retry_{frames_per_chunk}"
+    shutil.rmtree(retry_dir, ignore_errors=True)
+    retry_dir.mkdir(parents=True, exist_ok=True)
+    run_cmd(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(chunk_path),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "20",
+            "-g",
+            str(frames_per_chunk),
+            "-keyint_min",
+            str(frames_per_chunk),
+            "-sc_threshold",
+            "0",
+            "-force_key_frames",
+            f"expr:gte(t,n_forced*{frames_per_chunk / 15.0:.6f})",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "segment",
+            "-segment_time",
+            f"{frames_per_chunk / 15.0:.6f}",
+            "-segment_time_delta",
+            "0.05",
+            "-segment_format",
+            "mp4",
+            "-reset_timestamps",
+            "1",
+            str(retry_dir / "part_%04d.mp4"),
+        ]
+    )
+    retry_files = sorted(retry_dir.glob("part_*.mp4"))
+    if not retry_files:
+        raise RuntimeError(f"failed to build low-memory retry chunks for {chunk_path}")
+    return retry_dir, retry_files
+
+
+def run_chunk_low_memory(chunk_path: Path, prompt: str) -> list[dict]:
+    retry_sizes = []
+    next_size = min(LOW_MEMORY_CHUNK_FRAMES, CHUNK_FRAMES)
+    while next_size >= LOW_MEMORY_MIN_CHUNK_FRAMES:
+        if next_size not in retry_sizes:
+            retry_sizes.append(next_size)
+        next_size //= 2
+
+    last_exc = None
+    for frames_per_chunk in retry_sizes:
+        retry_dir = None
+        try:
+            LOGGER.warning(
+                "retrying chunk in low-memory mode chunk=%s prompt=%s subchunk_frames=%s",
+                chunk_path.name,
+                prompt,
+                frames_per_chunk,
+            )
+            retry_dir, retry_files = build_low_memory_chunk_files(chunk_path, frames_per_chunk)
+            merged_frames = []
+            frame_offset = 0
+            for retry_file in retry_files:
+                predictor = make_predictor()
+                try:
+                    frames = run_chunk(predictor, retry_file, prompt, max_frames_to_track=frames_per_chunk)
+                finally:
+                    del predictor
+                    release_cuda_memory()
+                for frame in frames:
+                    frame["frame_index"] = int(frame["frame_index"]) + frame_offset
+                merged_frames.extend(frames)
+                frame_offset += len(frames)
+            return merged_frames
+        except Exception as exc:
+            last_exc = exc
+            if not is_cuda_oom(exc):
+                raise
+            LOGGER.warning(
+                "low-memory retry still hit cuda oom chunk=%s prompt=%s subchunk_frames=%s",
+                chunk_path.name,
+                prompt,
+                frames_per_chunk,
+                exc_info=True,
+            )
+        finally:
+            if retry_dir is not None:
+                shutil.rmtree(retry_dir, ignore_errors=True)
+            release_cuda_memory()
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"low-memory retry failed for {chunk_path}")
 
 
 def write_chunk_result(item, prompt, chunk_index, chunk_file, frames):
@@ -1049,7 +1214,35 @@ def process_item(worker_name, item):
                         chunk_index,
                         chunk_file.name,
                     )
-                    frames = run_chunk(predictor, chunk_file, prompt)
+                    frames = run_chunk(
+                        predictor,
+                        chunk_file,
+                        prompt,
+                        max_frames_to_track=min(INFERENCE_BATCH_SIZE, CHUNK_FRAMES),
+                    )
+                except Exception as exc:
+                    if not is_cuda_oom(exc):
+                        raise
+                    LOGGER.warning(
+                        "cuda oom during chunk; retrying in low-memory mode manifest_index=%s prompt=%s chunk=%s",
+                        item["manifest_index"],
+                        prompt,
+                        chunk_index,
+                        exc_info=True,
+                    )
+                    del predictor
+                    predictor = None
+                    release_cuda_memory()
+                    frames = run_chunk_low_memory(chunk_file, prompt)
+                    predictor = make_predictor()
+                    LOGGER.info(
+                        "low-memory retry succeeded manifest_index=%s prompt=%s chunk=%s frames=%s",
+                        item["manifest_index"],
+                        prompt,
+                        chunk_index,
+                        len(frames),
+                    )
+                try:
                     remote_path = write_chunk_result(item, prompt, chunk_index, chunk_file, frames)
                     note_chunk_upload(item["manifest_index"], prompt, chunk_index, remote_path)
                     LOGGER.info(
@@ -1082,7 +1275,8 @@ def process_item(worker_name, item):
         LOGGER.info("process item complete worker=%s manifest_index=%s", worker_name, item["manifest_index"])
         return True
     finally:
-        del predictor
+        if predictor is not None:
+            del predictor
         release_cuda_memory()
 
 
@@ -1208,6 +1402,7 @@ def main():
     p_worker.add_argument("--worker-name", required=True)
     p_worker.add_argument("--gpu", required=True, type=int)
     sub.add_parser("launch")
+    sub.add_parser("retry-failed")
     sub.add_parser("status")
     sub.add_parser("stop")
     args = parser.parse_args()
@@ -1219,6 +1414,8 @@ def main():
         worker_loop(args.worker_name, args.gpu)
     elif args.cmd == "launch":
         launch()
+    elif args.cmd == "retry-failed":
+        retry_failed()
     elif args.cmd == "status":
         status()
     elif args.cmd == "stop":

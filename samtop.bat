@@ -1,3 +1,3 @@
 @echo off
 setlocal
-python "%~dp0automate_sam3_remote.py" samtop %*
+python "%~dp0sam3-pipe" samtop %*

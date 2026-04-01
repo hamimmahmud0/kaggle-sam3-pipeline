@@ -219,7 +219,10 @@ def resolve_config(args) -> dict:
         "verify": ["password"],
         "setup": ["password", "drive_folder_url"],
         "upload-pipeline": ["password"],
+        "upload-env": ["password"],
         "launch": ["password"],
+        "stop": ["password"],
+        "retry-failed": ["password"],
         "status": ["password"],
         "samtop": ["password"],
         "samlog": ["password"],
@@ -461,12 +464,48 @@ def upload_pipeline(r: RemoteRunner):
     r.bash("python -m py_compile /kaggle/working/SAM3/sam3_remote_pipeline.py", timeout=600)
 
 
+def upload_env_file(r: RemoteRunner, env_file_path: Path, cfg: dict):
+    print_step("Uploading the local .env to the remote workspace")
+    if not env_file_path.exists():
+        raise FileNotFoundError(f".env file not found: {env_file_path}")
+    remote_env_path = str(PurePosixPath(cfg["remote_workspace"]) / ".env")
+    r.bash(f"mkdir -p {shlex.quote(cfg['remote_workspace'])}", timeout=120)
+    r.write_text(remote_env_path, env_file_path.read_text(encoding="utf-8"))
+    print(f"Uploaded {env_file_path} -> {remote_env_path}")
+
+
 def launch_pipeline(r: RemoteRunner):
     print_step("Launching the 2-worker remote pipeline")
     _, out, err = r.bash(
         """
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_TOKEN="${HF_TOKEN:-}"
+/kaggle/working/SAM3/run_pipeline.sh launch
+/kaggle/working/SAM3/run_pipeline.sh status
+""",
+        timeout=1800,
+    )
+    print((out + ("\n" + err if err else "")).strip())
+
+
+def stop_pipeline(r: RemoteRunner):
+    print_step("Stopping the remote pipeline workers")
+    _, out, err = r.bash(
+        """
+/kaggle/working/SAM3/run_pipeline.sh stop
+/kaggle/working/SAM3/run_pipeline.sh status
+""",
+        timeout=600,
+        check=False,
+    )
+    print((out + ("\n" + err if err else "")).strip())
+
+
+def retry_failed_pipeline(r: RemoteRunner):
+    print_step("Resetting failed remote items and restarting workers")
+    _, out, err = r.bash(
+        """
+/kaggle/working/SAM3/run_pipeline.sh retry-failed
 /kaggle/working/SAM3/run_pipeline.sh launch
 /kaggle/working/SAM3/run_pipeline.sh status
 """,
@@ -911,7 +950,19 @@ def parse_args():
     parser.add_argument("--lines", type=int, default=80, help="How many existing log lines samlog should show before following.")
     parser.add_argument(
         "command",
-        choices=["verify", "setup", "upload-pipeline", "launch", "status", "samtop", "samlog", "full"],
+        choices=[
+            "verify",
+            "setup",
+            "upload-pipeline",
+            "upload-env",
+            "launch",
+            "stop",
+            "retry-failed",
+            "status",
+            "samtop",
+            "samlog",
+            "full",
+        ],
         help="Which automation step to run.",
     )
     return parser.parse_args()
@@ -920,6 +971,7 @@ def parse_args():
 def main():
     args = parse_args()
     cfg = resolve_config(args)
+    env_file_path = Path(args.env_file) if args.env_file else ROOT / ".env"
 
     runner = RemoteRunner(cfg["host"], cfg["port"], cfg["username"], cfg["password"])
     try:
@@ -930,8 +982,14 @@ def main():
             full_setup(runner, cfg)
         elif args.command == "upload-pipeline":
             upload_pipeline(runner)
+        elif args.command == "upload-env":
+            upload_env_file(runner, env_file_path, cfg)
         elif args.command == "launch":
             launch_pipeline(runner)
+        elif args.command == "stop":
+            stop_pipeline(runner)
+        elif args.command == "retry-failed":
+            retry_failed_pipeline(runner)
         elif args.command == "status":
             show_status(runner)
         elif args.command == "samtop":

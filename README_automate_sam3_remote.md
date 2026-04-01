@@ -1,6 +1,6 @@
 # Remote SAM3 Automation
 
-This document explains how to use `automate_sam3_remote.py`.
+This document explains how to use `sam3-pipe`.
 
 ## What It Does
 
@@ -26,7 +26,7 @@ It can:
 
 The script depends on these local files:
 
-- `automate_sam3_remote.py`
+- `sam3-pipe`
 - `sam3_remote_pipeline.py`
 - `run_pipeline.sh`
 
@@ -95,7 +95,7 @@ You can also provide these through:
 Checks remote connectivity, Python, working directory, GPU visibility, and MEGA auth.
 
 ```bash
-python automate_sam3_remote.py verify --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
+python sam3-pipe verify --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
 ```
 
 ### 2. Setup
@@ -103,7 +103,7 @@ python automate_sam3_remote.py verify --password YOUR_SSH_PASSWORD --drive-folde
 Runs the remote preparation steps without launching workers.
 
 ```bash
-python automate_sam3_remote.py setup --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
+python sam3-pipe setup --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
 ```
 
 ### 3. Upload Pipeline Only
@@ -111,7 +111,7 @@ python automate_sam3_remote.py setup --password YOUR_SSH_PASSWORD --drive-folder
 Uploads the latest local remote-worker scripts to the notebook.
 
 ```bash
-python automate_sam3_remote.py upload-pipeline --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
+python sam3-pipe upload-pipeline --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
 ```
 
 ### 4. Launch
@@ -119,7 +119,7 @@ python automate_sam3_remote.py upload-pipeline --password YOUR_SSH_PASSWORD --dr
 Starts the 2-worker remote pipeline.
 
 ```bash
-python automate_sam3_remote.py launch --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
+python sam3-pipe launch --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
 ```
 
 ### 5. Status
@@ -127,7 +127,7 @@ python automate_sam3_remote.py launch --password YOUR_SSH_PASSWORD --drive-folde
 Prints worker state, `nvidia-smi`, and session summary.
 
 ```bash
-python automate_sam3_remote.py status --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
+python sam3-pipe status --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
 ```
 
 ### 6. Full
@@ -135,7 +135,7 @@ python automate_sam3_remote.py status --password YOUR_SSH_PASSWORD --drive-folde
 Runs setup, uploads the pipeline, launches it, and prints status.
 
 ```bash
-python automate_sam3_remote.py full --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
+python sam3-pipe full --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
 ```
 
 ### 7. Samtop
@@ -153,7 +153,7 @@ It displays:
 Run it directly through Python:
 
 ```bash
-python automate_sam3_remote.py samtop --password YOUR_SSH_PASSWORD
+python sam3-pipe samtop --password YOUR_SSH_PASSWORD
 ```
 
 Or from this repo on Ubuntu/Linux:
@@ -172,8 +172,8 @@ samtop
 Helpful options:
 
 ```bash
-python automate_sam3_remote.py samtop --refresh-seconds 1
-python automate_sam3_remote.py samtop --once
+python sam3-pipe samtop --refresh-seconds 1
+python sam3-pipe samtop --once
 ```
 
 Press `q` to quit the live view.
@@ -185,7 +185,7 @@ Streams the remote worker logs in one terminal view with a prefix per worker.
 Run it directly through Python:
 
 ```bash
-python automate_sam3_remote.py samlog --password YOUR_SSH_PASSWORD
+python sam3-pipe samlog --password YOUR_SSH_PASSWORD
 ```
 
 Or from this repo on Ubuntu/Linux:
@@ -203,7 +203,7 @@ samlog
 Helpful option:
 
 ```bash
-python automate_sam3_remote.py samlog --lines 200
+python sam3-pipe samlog --lines 200
 ```
 
 ## .env Mode
@@ -227,7 +227,7 @@ SAM3_REMOTE_MINIFORGE=/kaggle/working/miniforge3
 Run with:
 
 ```bash
-python automate_sam3_remote.py full --env-file .env.sam3
+python sam3-pipe full --env-file .env.sam3
 ```
 
 If `--env-file` is omitted, the script now auto-loads `./.env` when present.
@@ -255,7 +255,7 @@ Example `sam3_remote.json`:
 Run with:
 
 ```bash
-python automate_sam3_remote.py full --config-file sam3_remote.json
+python sam3-pipe full --config-file sam3_remote.json
 ```
 
 ## Precedence
@@ -274,12 +274,12 @@ That means CLI flags win if the same value appears in multiple places.
 Examples:
 
 ```bash
-python automate_sam3_remote.py full --host 127.0.0.1 --port 10022 --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
-python automate_sam3_remote.py setup --hf-token YOUR_TOKEN
-python automate_sam3_remote.py setup --drive-folder-url YOUR_FOLDER_URL
-python automate_sam3_remote.py status --password YOUR_SSH_PASSWORD
-python automate_sam3_remote.py full --env-file .env.sam3
-python automate_sam3_remote.py full --config-file sam3_remote.json
+python sam3-pipe full --host 127.0.0.1 --port 10022 --password YOUR_SSH_PASSWORD --drive-folder-url YOUR_FOLDER_URL
+python sam3-pipe setup --hf-token YOUR_TOKEN
+python sam3-pipe setup --drive-folder-url YOUR_FOLDER_URL
+python sam3-pipe status --password YOUR_SSH_PASSWORD
+python sam3-pipe full --env-file .env.sam3
+python sam3-pipe full --config-file sam3_remote.json
 ```
 
 ## Remote Paths
@@ -320,14 +320,14 @@ If `verify` fails:
 If MEGA fails:
 
 - log in on the remote notebook first with `mega-login`
-- rerun `python automate_sam3_remote.py verify`
+- rerun `python sam3-pipe verify`
 
 If the pipeline scripts change locally:
 
-- rerun `python automate_sam3_remote.py upload-pipeline`
+- rerun `python sam3-pipe upload-pipeline`
 
 If you want a fresh end-to-end redeploy:
 
 ```bash
-python automate_sam3_remote.py full --password YOUR_SSH_PASSWORD --drive-folder-id YOUR_FOLDER_ID --drive-folder-url YOUR_FOLDER_URL
+python sam3-pipe full --password YOUR_SSH_PASSWORD --drive-folder-id YOUR_FOLDER_ID --drive-folder-url YOUR_FOLDER_URL
 ```
